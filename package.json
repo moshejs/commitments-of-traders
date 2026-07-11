@@ -1,0 +1,57 @@
+{
+  "name": "commitments-of-traders",
+  "version": "1.0.0",
+  "description": "Typed, zero-dependency client for the CFTC Commitments of Traders (COT) reports — Legacy, Disaggregated, and Traders in Financial Futures, futures-only or combined, via the official Socrata API. No API key required.",
+  "keywords": [
+    "cftc",
+    "commitments-of-traders",
+    "cot",
+    "cot-report",
+    "futures",
+    "positioning",
+    "traders-in-financial-futures",
+    "disaggregated",
+    "finance",
+    "trading",
+    "api-client",
+    "socrata"
+  ],
+  "homepage": "https://moshemalka.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moshejs/commitments-of-traders.git"
+  },
+  "bugs": "https://github.com/moshejs/commitments-of-traders/issues",
+  "author": "Moshe Malka <hello@moshemalka.com> (https://moshemalka.com)",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "smoke": "node scripts/smoke.mjs",
+    "prepublishOnly": "npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
