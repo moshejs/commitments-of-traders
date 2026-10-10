@@ -27,6 +27,10 @@ export interface CotOptions {
   baseUrl?: string;
   /** Optional Socrata app token (raises rate limits; not required). */
   appToken?: string;
+  /** Abort the request after this many milliseconds (no timeout by default). */
+  timeoutMs?: number;
+  /** AbortSignal to cancel the request. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -47,9 +51,14 @@ export interface CotRow {
 }
 
 export interface QueryParams {
-  /** Filter to one market name (SoQL `like %…%`, case-insensitive contains). */
+  /**
+   * Case-insensitive contains-match on `market_and_exchange_names` (SoQL
+   * `like '%…%'`, so `%` and `_` act as wildcards). Note "GOLD" also matches
+   * "MICRO GOLD", and the CFTC renamed many markets in Feb 2022 — prefer
+   * `contractMarketCode` for one market's history.
+   */
   market?: string;
-  /** Exact CFTC contract market code. */
+  /** Exact CFTC contract market code, e.g. "13874A" (E-mini S&P 500). Stable across renames. */
   contractMarketCode?: string;
   /** Report date lower bound (inclusive), YYYY-MM-DD. */
   since?: string;
@@ -59,7 +68,10 @@ export interface QueryParams {
   where?: string;
   /** Columns to select (SoQL `$select`). Default all. */
   select?: string[];
-  /** Sort column and direction. Default report date descending. */
+  /**
+   * SoQL `$order`. Default: report date descending, then market name and row
+   * id, so ties are deterministic and `offset` paging is stable.
+   */
   order?: string;
   /** Row cap (Socrata `$limit`). Default 1000. */
   limit?: number;
@@ -67,12 +79,16 @@ export interface QueryParams {
   offset?: number;
 }
 
+/**
+ * Thrown for non-2xx responses (with Socrata's own error message appended
+ * when it sends one, e.g. "No such column") and for non-JSON bodies.
+ */
 export class CotError extends Error {
   readonly status: number;
   readonly url: string;
 
-  constructor(status: number, url: string) {
-    super(`CFTC COT request failed with HTTP ${status}: ${url}`);
+  constructor(status: number, url: string, message?: string) {
+    super(message ?? `CFTC COT request failed with HTTP ${status}: ${url}`);
     this.name = "CotError";
     this.status = status;
     this.url = url;
@@ -80,6 +96,7 @@ export class CotError extends Error {
 }
 
 const DEFAULT_BASE = "https://publicreporting.cftc.gov";
+const DEFAULT_ORDER = "report_date_as_yyyy_mm_dd DESC, market_and_exchange_names ASC, id ASC";
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 /** Escape a single-quoted SoQL string literal. */
@@ -88,7 +105,11 @@ function soqlString(value: string): string {
 }
 
 function checkDate(d: string, label: string): void {
-  if (!ISO_DATE_RE.test(d)) throw new RangeError(`Invalid ${label}: "${d}" (expected YYYY-MM-DD)`);
+  const ok =
+    typeof d === "string" &&
+    ISO_DATE_RE.test(d) &&
+    new Date(`${d}T00:00:00Z`).toISOString().slice(0, 10) === d;
+  if (!ok) throw new RangeError(`Invalid ${label}: "${d}" (expected a real YYYY-MM-DD date)`);
 }
 
 function buildWhere(params: QueryParams): string | undefined {
@@ -105,6 +126,9 @@ function buildWhere(params: QueryParams): string | undefined {
   }
   if (params.until !== undefined) {
     checkDate(params.until, "until");
+    if (params.since !== undefined && params.since > params.until) {
+      throw new RangeError(`since ${params.since} is after until ${params.until}`);
+    }
     clauses.push(`report_date_as_yyyy_mm_dd <= '${params.until}T23:59:59.999'`);
   }
   if (params.where !== undefined) clauses.push(`(${params.where})`);
@@ -131,7 +155,7 @@ async function request(
   if (params.select && params.select.length) sp.set("$select", params.select.join(","));
   const where = buildWhere(params);
   if (where) sp.set("$where", where);
-  sp.set("$order", params.order ?? "report_date_as_yyyy_mm_dd DESC");
+  sp.set("$order", params.order ?? DEFAULT_ORDER);
   if (params.limit !== undefined) {
     if (!Number.isInteger(params.limit) || params.limit <= 0 || params.limit > 50000) {
       throw new RangeError(`limit must be an integer in 1–50000, got ${params.limit}`);
@@ -147,12 +171,49 @@ async function request(
     sp.set("$offset", String(params.offset));
   }
 
-  const url = `${base}/resource/${datasetId}.json?${sp.toString()}`;
+  if (!/^[a-z0-9]{4}-[a-z0-9]{4}$/.test(datasetId)) {
+    throw new RangeError(`Invalid Socrata dataset id: "${datasetId}" (expected e.g. "6dca-aqww")`);
+  }
+  const url = `${base.replace(/\/+$/, "")}/resource/${datasetId}.json?${sp.toString()}`;
   const headers: Record<string, string> = { accept: "application/json" };
   if (opts.appToken) headers["X-App-Token"] = opts.appToken;
-  const res = await doFetch(url, { headers });
-  if (!res.ok) throw new CotError(res.status, url);
-  return (await res.json()) as CotRow[];
+  const res = await doFetch(url, { headers, signal: signalFor(opts) });
+  const text = await res.text();
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    if (!res.ok) throw new CotError(res.status, url);
+    throw new CotError(res.status, url, `CFTC COT returned a non-JSON response (HTTP ${res.status}): ${url}`);
+  }
+  if (!res.ok) {
+    const msg = (body as { message?: unknown } | null)?.message;
+    throw new CotError(
+      res.status,
+      url,
+      `CFTC COT request failed with HTTP ${res.status}: ${url}` +
+        (typeof msg === "string" ? ` — ${msg.slice(0, 300)}` : ""),
+    );
+  }
+  if (!Array.isArray(body)) {
+    throw new CotError(res.status, url, `Unexpected CFTC COT response (expected an array of rows): ${url}`);
+  }
+  return body as CotRow[];
+}
+
+function signalFor(opts: CotOptions): AbortSignal | undefined {
+  const { signal, timeoutMs } = opts;
+  if (timeoutMs === undefined) return signal;
+  if (!(timeoutMs > 0)) throw new RangeError(`timeoutMs must be > 0, got ${timeoutMs}`);
+  const timeout = AbortSignal.timeout(timeoutMs);
+  if (!signal) return timeout;
+  // AbortSignal.any is Node 20+; combine by hand for Node 18.
+  const ctrl = new AbortController();
+  const abort = (s: AbortSignal) => () => ctrl.abort(s.reason);
+  if (signal.aborted) ctrl.abort(signal.reason);
+  signal.addEventListener("abort", abort(signal), { once: true });
+  timeout.addEventListener("abort", abort(timeout), { once: true });
+  return ctrl.signal;
 }
 
 /**
@@ -176,22 +237,50 @@ export async function getCotReport(
   return request(resolveDataset(report, include), params, opts);
 }
 
+/** The part of "GOLD - COMMODITY EXCHANGE INC." before the exchange. */
+function marketPart(name: string | undefined): string {
+  return (name ?? "").split(" - ")[0]!.trim().toUpperCase();
+}
+
 /**
- * The single most recent report row for a market in a report family.
- * Returns null if the market matches nothing.
+ * The single most recent report row for one market in a report family.
+ * Returns null if nothing matches.
+ *
+ * `market` is either a name (case-insensitive contains-match) or
+ * `{ contractMarketCode }`. A name that matches several markets in the latest
+ * report resolves to the one whose contract market name equals it exactly
+ * ("GOLD" → GOLD, not MICRO GOLD); if that still leaves more than one,
+ * a RangeError lists the candidates.
  */
 export async function latestForMarket(
   report: CotReport,
-  market: string,
+  market: string | { contractMarketCode: string },
   include: CotInclude = "futures-only",
   opts: CotOptions = {},
 ): Promise<CotRow | null> {
-  const rows = await request(
-    resolveDataset(report, include),
-    { market, limit: 1, order: "report_date_as_yyyy_mm_dd DESC" },
-    opts,
+  const dataset = resolveDataset(report, include);
+  if (typeof market !== "string") {
+    const rows = await request(dataset, { contractMarketCode: market.contractMarketCode, limit: 1 }, opts);
+    return rows[0] ?? null;
+  }
+  const rows = await request(dataset, { market, limit: 100 }, opts);
+  if (!rows.length) return null;
+  const latestDate = rows[0]!.report_date_as_yyyy_mm_dd;
+  const latest = rows.filter((r) => r.report_date_as_yyyy_mm_dd === latestDate);
+  if (latest.length === 1) return latest[0]!;
+  const want = market.trim().toUpperCase();
+  const exact = latest.filter(
+    (r) =>
+      (r.market_and_exchange_names ?? "").toUpperCase() === want ||
+      (r.contract_market_name ?? "").trim().toUpperCase() === want ||
+      marketPart(r.market_and_exchange_names) === want,
   );
-  return rows[0] ?? null;
+  if (exact.length === 1) return exact[0]!;
+  const names = latest.map((r) => `${r.market_and_exchange_names} (${r.cftc_contract_market_code})`);
+  throw new RangeError(
+    `Market "${market}" is ambiguous in the ${latestDate.slice(0, 10)} report — it matches ` +
+      `${names.join("; ")}. Use a more specific name or { contractMarketCode }.`,
+  );
 }
 
 /** Query directly by Socrata dataset id (escape hatch for exotic needs). */

@@ -13,20 +13,23 @@ The weekly COT report is one of the most-watched positioning datasets in futures
 ```ts
 import { getCotReport, latestForMarket, num } from "commitments-of-traders";
 
-// Latest E-mini S&P 500 large-speculator positioning:
+// Latest E-mini S&P 500 large-speculator positioning
+// ("E-MINI S&P 500" also matches MICRO E-MINI; the exact name wins):
 const es = await latestForMarket("legacy", "E-MINI S&P 500");
 const net = num(es.noncomm_positions_long_all) - num(es.noncomm_positions_short_all);
 
 // Managed-money gold positioning (disaggregated, futures + options):
-const gold = await getCotReport("disaggregated", "combined", { market: "GOLD", limit: 1 });
-num(gold[0].m_money_positions_long_all);
+const gold = await latestForMarket("disaggregated", "GOLD", "combined");
+num(gold.m_money_positions_long_all);
 
-// A full year of one market, with a raw SoQL filter ANDed in:
+// History of one market: use its contract market code, which survives the
+// CFTC's Feb 2022 renames ("10-YEAR U.S. TREASURY NOTES" → "UST 10Y NOTE"):
 const history = await getCotReport("tff", "futures-only", {
-  market: "10-YEAR U.S. TREASURY",
+  contractMarketCode: "043602",
   since: "2025-01-01",
-  where: "open_interest_all > 1000000",
+  where: "open_interest_all > 1000000", // raw SoQL, ANDed in
 });
+num(history[0].lev_money_positions_long); // TFF columns have no _all suffix
 ```
 
 ## Reports
@@ -39,18 +42,20 @@ All three families, in both futures-only and combined (futures + options) forms 
 | `"disaggregated"` | Disaggregated — Futures Only | Disaggregated — Combined |
 | `"tff"` | TFF — Futures Only | TFF — Combined |
 
-(The exact Socrata resource IDs are exported as `DATASETS` and were verified against publicreporting.cftc.gov.)
+(The exact Socrata resource IDs are exported as `DATASETS`. Each was checked against the dataset's title on publicreporting.cftc.gov, and the 2026 rows of all six were cross-checked against the CFTC's own annual text files at cftc.gov/files/dea/history: identical row counts, no value mismatches.)
 
 ## API
 
-Every function takes an optional final `options`: `{ fetch?, baseUrl?, appToken? }` — inject `fetch` for tests, or a Socrata app token to raise rate limits (not required).
+Every function takes an optional final `options`: `{ fetch?, baseUrl?, appToken?, timeoutMs?, signal? }` — inject `fetch` for tests, a Socrata app token to raise rate limits (not required), or `timeoutMs`/`signal` to abort (no timeout by default).
 
 - **`getCotReport(report, include?, params?)`** — query a report family (`include` defaults to `"futures-only"`).
-- **`latestForMarket(report, market, include?)`** — the single most recent row for a market, or `null`.
+- **`latestForMarket(report, market, include?)`** — the single most recent row for one market, or `null`. `market` is a name (contains-match) or `{ contractMarketCode }`. When a name matches several markets in the latest report (e.g. `"GOLD"` → GOLD and MICRO GOLD), the one whose contract market name equals it exactly is returned; otherwise it throws a `RangeError` listing the candidates. If the name only matches a market that has since been renamed, you get its last row under the old name — check `report_date_as_yyyy_mm_dd`.
 - **`queryDataset(datasetId, params?)`** — query by raw Socrata id.
 - **`num(value)`** — Socrata returns every column as a string; `num` converts to `number | null`.
 
-**`params`**: `market` (case-insensitive contains-match), `contractMarketCode`, `since` / `until` (YYYY-MM-DD), `where` (raw SoQL, ANDed in), `select`, `order`, `limit`, `offset`. Market names and codes are safely escaped. Failures throw `CotError` with `status` and `url`.
+**`params`**: `market` (case-insensitive contains-match; `%` and `_` act as SoQL wildcards), `contractMarketCode` (exact, stable across renames — the right key for one market's history), `since` / `until` (inclusive YYYY-MM-DD), `where` (raw SoQL, ANDed in — not escaped, so never pass untrusted input here), `select`, `order` (default: report date descending, then market name, then row id — deterministic, so `offset` paging is stable), `limit` (default 1000, max 50000), `offset`. Values passed as `market` and `contractMarketCode` are escaped as SoQL string literals.
+
+**Errors**: non-2xx responses throw `CotError` with `status`, `url`, and Socrata's own message when it sends one (e.g. `No such column`). Non-JSON or non-array bodies also throw `CotError`. Invalid arguments (bad dates, reversed ranges, bad limit/offset, malformed dataset ids) throw `RangeError` before any request.
 
 Rows are typed for the always-present identity columns (market, report date, codes, open interest) with an index signature for the hundreds of position columns that vary by report family. The mocked test suite runs offline; `npm run smoke` exercises the live API.
 

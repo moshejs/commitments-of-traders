@@ -7,12 +7,13 @@ import {
   num,
   queryDataset,
 } from "../src/index.js";
+import { goldLatest, tenYear2022 } from "./fixtures.js";
 
 function mockFetch(body: unknown, status = 200) {
   return vi.fn(async () => ({
     ok: status >= 200 && status < 300,
     status,
-    json: async () => body,
+    text: async () => (typeof body === "string" ? body : JSON.stringify(body)),
   })) as unknown as typeof fetch;
 }
 
@@ -44,7 +45,9 @@ describe("dataset routing", () => {
     await getCotReport("disaggregated", "combined", { limit: 5 }, { fetch: f });
     expect(url(f)).toContain("/resource/kh3c-gbw2.json?");
     expect(url(f)).toContain("$limit=5");
-    expect(url(f)).toContain("$order=report_date_as_yyyy_mm_dd DESC");
+    expect(url(f)).toContain(
+      "$order=report_date_as_yyyy_mm_dd DESC, market_and_exchange_names ASC, id ASC",
+    );
   });
 
   it("rejects unknown report/include", async () => {
@@ -116,7 +119,7 @@ describe("latestForMarket", () => {
     const f = mockFetch([ROW]);
     const row = await latestForMarket("legacy", "E-MINI S&P 500", "futures-only", { fetch: f });
     expect(row?.market_and_exchange_names).toContain("E-MINI S&P 500");
-    expect(url(f)).toContain("$limit=1");
+    expect(url(f)).toContain("$limit=100");
   });
 
   it("returns null when nothing matches", async () => {
@@ -150,5 +153,77 @@ describe("errors, validation, and helpers", () => {
     expect(num("")).toBeNull();
     expect(num("  ")).toBeNull();
     expect(num(undefined)).toBeNull();
+  });
+});
+
+describe("latestForMarket disambiguation (live-response fixtures)", () => {
+  it('"GOLD" resolves to GOLD, not MICRO GOLD, whatever order the server returns ties in', async () => {
+    const micro = goldLatest.find((r) => r.market_and_exchange_names.startsWith("MICRO"))!;
+    const gold = goldLatest.find((r) => r.market_and_exchange_names.startsWith("GOLD"))!;
+    for (const rows of [[micro, gold], [gold, micro]]) {
+      const row = await latestForMarket("disaggregated", "GOLD", "combined", { fetch: mockFetch(rows) });
+      expect(row!.market_and_exchange_names).toBe("GOLD - COMMODITY EXCHANGE INC.");
+      expect(row!.cftc_contract_market_code).toBe("088691");
+    }
+  });
+
+  it("throws a RangeError listing candidates when still ambiguous", async () => {
+    await expect(
+      latestForMarket("tff", "10-YEAR", "futures-only", { fetch: mockFetch(tenYear2022) }),
+    ).rejects.toThrow(/ambiguous.*043602.*043607/);
+  });
+
+  it("returns the only latest-date match even when older rows differ", async () => {
+    const newer = { ...goldLatest[0]!, report_date_as_yyyy_mm_dd: "2026-10-13T00:00:00.000" };
+    const row = await latestForMarket("disaggregated", "GOLD", "combined", {
+      fetch: mockFetch([newer, ...goldLatest]),
+    });
+    expect(row!.report_date_as_yyyy_mm_dd).toBe("2026-10-13T00:00:00.000");
+  });
+
+  it("accepts { contractMarketCode }", async () => {
+    const f = mockFetch([goldLatest[0]]);
+    await latestForMarket("disaggregated", { contractMarketCode: "088691" }, "combined", { fetch: f });
+    expect(url(f)).toContain("$where=cftc_contract_market_code = '088691'");
+    expect(url(f)).toContain("$limit=1");
+  });
+});
+
+describe("hardening", () => {
+  it("includes Socrata's error message; wraps non-JSON and non-array bodies", async () => {
+    const f = mockFetch({ message: "Query coordinator error: query.soql.no-such-column" }, 400);
+    await expect(queryDataset("6dca-aqww", {}, { fetch: f })).rejects.toThrow(/HTTP 400.*no-such-column/);
+    await expect(queryDataset("6dca-aqww", {}, { fetch: mockFetch("<html>", 200) })).rejects.toThrow(
+      /non-JSON/,
+    );
+    await expect(queryDataset("6dca-aqww", {}, { fetch: mockFetch({ error: true }) })).rejects.toBeInstanceOf(
+      CotError,
+    );
+  });
+
+  it("rejects malformed dataset ids, impossible dates and reversed ranges", async () => {
+    const f = mockFetch([]);
+    await expect(queryDataset("../views/x", {}, { fetch: f })).rejects.toThrow(/dataset id/);
+    await expect(getCotReport("legacy", "futures-only", { since: "2026-02-30" }, { fetch: f })).rejects.toThrow(
+      RangeError,
+    );
+    await expect(
+      getCotReport("legacy", "futures-only", { since: "2026-07-01", until: "2026-01-01" }, { fetch: f }),
+    ).rejects.toThrow(/after until/);
+  });
+
+  it("honors timeoutMs and trims a trailing baseUrl slash", async () => {
+    const f = mockFetch([]);
+    await queryDataset("6dca-aqww", {}, { fetch: f, baseUrl: "https://proxy.local/", timeoutMs: 1000 });
+    expect(url(f)).toMatch(/^https:\/\/proxy\.local\/resource\/6dca-aqww\.json\?/);
+    const hang = vi.fn(
+      (_url: string, init: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init.signal!.addEventListener("abort", () => reject(init.signal!.reason));
+        }),
+    ) as unknown as typeof fetch;
+    await expect(queryDataset("6dca-aqww", {}, { fetch: hang, timeoutMs: 20 })).rejects.toMatchObject({
+      name: "TimeoutError",
+    });
   });
 });

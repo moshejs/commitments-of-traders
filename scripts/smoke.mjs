@@ -12,9 +12,9 @@ if (es) {
   console.log(`E-MINI S&P 500 non-commercial: long ${long}, short ${short}, net ${long - short}`);
 }
 
-const dis = await getCotReport("disaggregated", "combined", { market: "GOLD", limit: 1 });
-console.log(`disaggregated GOLD managed-money long: ${num(dis[0]?.m_money_positions_long_all)}`);
+const gold = await latestForMarket("disaggregated", "GOLD", "combined");
+console.log(`disaggregated ${gold?.market_and_exchange_names} managed-money long: ${num(gold?.m_money_positions_long_all)}`);
 
-const tff = await getCotReport("tff", "futures-only", { market: "10-YEAR", limit: 1 });
-console.log(`TFF 10-YEAR row: ${tff[0]?.market_and_exchange_names ?? "none"}`);
+const tff = await getCotReport("tff", "futures-only", { contractMarketCode: "043602", limit: 1 });
+console.log(`TFF 043602 row: ${tff[0]?.market_and_exchange_names ?? "none"} ${tff[0]?.report_date_as_yyyy_mm_dd?.slice(0, 10)}`);
 console.log("SMOKE OK");
